@@ -16,7 +16,7 @@ import {
   writeBatch
 } from 'firebase/firestore';
 import { db } from '@/lib/firebase';
-import { Room, Player, ChatMessage } from '@/types/game';
+import { Room, Player, ChatMessage, PlayerClue } from '@/types/game';
 
 // Room operations
 export async function createRoom(roomCode: string, room: Omit<Room, 'id' | 'createdAt'>): Promise<string> {
@@ -105,4 +105,44 @@ export async function clearChatMessages(roomId: string): Promise<void> {
   });
   
   await batch.commit();
+}
+
+// Player clue operations
+export async function addPlayerClue(
+  roomId: string, 
+  playerId: string, 
+  clue: string, 
+  currentPlayers: Player[]
+): Promise<void> {
+  // Update the player's clues array
+  const updatedPlayers = currentPlayers.map(player => 
+    player.id === playerId 
+      ? { 
+          ...player, 
+          clues: [...(player.clues || []), clue], 
+          hasGivenClue: (player.clues?.length || 0) + 1 > 0
+        }
+      : player
+  );
+
+  await updateRoom(roomId, { players: updatedPlayers });
+}
+
+export function checkAllPlayersGaveClues(players: Player[]): boolean {
+  const activePlayers = players.filter(p => p.isAlive && !p.hasLeft);
+  return activePlayers.every(p => p.hasGivenClue);
+}
+
+export async function resetPlayersForNewRound(roomId: string, players: Player[]): Promise<void> {
+  const resetPlayers = players.map(player => ({
+    ...player,
+    clues: [],
+    hasGivenClue: false,
+    hasVoted: false
+  }));
+
+  await updateRoom(roomId, { 
+    players: resetPlayers,
+    votes: {}
+  });
 }

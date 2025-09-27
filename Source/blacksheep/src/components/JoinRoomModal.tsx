@@ -60,7 +60,10 @@ export default function JoinRoomModal({ onClose }: JoinRoomModalProps) {
         isAlive: true,
         isImposter: false,
         word: '',
-        hasVoted: false
+        hasVoted: false,
+        clues: [],
+        hasGivenClue: false,
+        hasLeft: false
       };
 
       // Add player to room

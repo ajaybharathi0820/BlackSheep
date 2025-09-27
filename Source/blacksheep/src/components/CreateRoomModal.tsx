@@ -33,7 +33,10 @@ export default function CreateRoomModal({ onClose }: CreateRoomModalProps) {
         isAlive: true,
         isImposter: false,
         word: '',
-        hasVoted: false
+        hasVoted: false,
+        clues: [],
+        hasGivenClue: false,
+        hasLeft: false
       };
 
       const roomId = await createRoom(roomCode, {

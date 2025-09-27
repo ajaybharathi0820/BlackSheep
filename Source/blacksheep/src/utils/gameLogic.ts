@@ -88,10 +88,11 @@ export function prepareNextRound(room: Room): {
   updatedPlayers: Player[];
   newRound: number;
 } {
-  // Reset voting state for next round
+  // Reset only voting state for next round - keep clues from previous rounds
   const updatedPlayers = room.players.map(player => ({
     ...player,
-    hasVoted: false
+    hasVoted: false,
+    hasGivenClue: false // Reset flag to allow new clue, but keep existing clues
   }));
   
   return {

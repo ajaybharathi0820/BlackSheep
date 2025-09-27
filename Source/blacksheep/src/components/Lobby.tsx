@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { Copy, Users, Play, LogOut } from 'lucide-react';
+import { Copy, Users, Play, LogOut, X } from 'lucide-react';
 import { Room, Player } from '@/types/game';
 import { updateRoom } from '@/utils/firebaseUtils';
 import { selectRandomImposter } from '@/utils/gameUtils';
@@ -37,7 +37,10 @@ export default function Lobby({ room, currentPlayer }: LobbyProps) {
         ...player,
         isImposter: player.id === imposterPlayer,
         word: player.id === imposterPlayer ? wordPair.imposter : wordPair.main,
-        hasVoted: false
+        hasVoted: false,
+        clues: [],
+        hasGivenClue: false,
+        hasLeft: false
       }));
 
       // Add used word pair to the list
@@ -59,16 +62,79 @@ export default function Lobby({ room, currentPlayer }: LobbyProps) {
     }
   };
 
-  const leaveRoom = () => {
+  const removePlayer = async (playerToRemove: Player) => {
+    if (!currentPlayer.isHost || playerToRemove.isHost) return;
+    
+    if (confirm(`Are you sure you want to remove ${playerToRemove.name} from the room?`)) {
+      try {
+        const updatedPlayers = room.players.filter(p => p.id !== playerToRemove.id);
+        await updateRoom(room.id, {
+          players: updatedPlayers
+        });
+      } catch (error) {
+        console.error('Error removing player:', error);
+        alert('Failed to remove player. Please try again.');
+      }
+    }
+  };
+
+  const leaveRoom = async () => {
     if (currentPlayer.isHost) {
-      if (confirm('Are you sure you want to leave? This will close the room for everyone.')) {
-        // Host leaving - could implement room deletion here
-        window.location.href = '/';
+      // Get remaining players (excluding current host)
+      const remainingPlayers = room.players.filter(p => p.id !== currentPlayer.id);
+      
+      if (remainingPlayers.length === 0) {
+        // No other players left, just leave
+        if (confirm('Are you sure you want to leave? This will close the room for everyone.')) {
+          localStorage.removeItem('playerId');
+          localStorage.removeItem('playerName');
+          window.location.href = '/';
+        }
+      } else {
+        // Transfer host to first remaining player
+        if (confirm('Are you sure you want to leave? Host privileges will be transferred to another player.')) {
+          try {
+            // Make the first remaining player the new host
+            const newHost = remainingPlayers[0];
+            const updatedPlayers = remainingPlayers.map(p => ({
+              ...p,
+              isHost: p.id === newHost.id
+            }));
+
+            await updateRoom(room.id, {
+              hostId: newHost.id,
+              players: updatedPlayers
+            });
+
+            localStorage.removeItem('playerId');
+            localStorage.removeItem('playerName');
+            window.location.href = '/';
+          } catch (error) {
+            console.error('Error transferring host and leaving room:', error);
+            alert('Failed to leave room. Please try again.');
+          }
+        }
       }
     } else {
       if (confirm('Are you sure you want to leave the room?')) {
-        // Non-host leaving - could implement player removal here
-        window.location.href = '/';
+        try {
+          // Non-host leaving before game starts - remove from player list
+          const updatedPlayers = room.players.filter(p => p.id !== currentPlayer.id);
+          await updateRoom(room.id, {
+            players: updatedPlayers
+          });
+          
+          // Clear localStorage and go home
+          localStorage.removeItem('playerId');
+          localStorage.removeItem('playerName');
+          window.location.href = '/';
+        } catch (error) {
+          console.error('Error leaving room:', error);
+          // Still go home even if there's an error
+          localStorage.removeItem('playerId');
+          localStorage.removeItem('playerName');
+          window.location.href = '/';
+        }
       }
     }
   };
@@ -147,11 +213,22 @@ export default function Lobby({ room, currentPlayer }: LobbyProps) {
                     </div>
                   </div>
                 </div>
-                {player.isHost && (
-                  <span className="text-yellow-300 text-sm font-medium px-2 py-1 bg-yellow-500/20 rounded">
-                    Host
-                  </span>
-                )}
+                <div className="flex items-center gap-2">
+                  {player.isHost && (
+                    <span className="text-yellow-300 text-sm font-medium px-2 py-1 bg-yellow-500/20 rounded">
+                      Host
+                    </span>
+                  )}
+                  {currentPlayer.isHost && !player.isHost && (
+                    <button
+                      onClick={() => removePlayer(player)}
+                      className="p-1 hover:bg-red-500/20 rounded transition-colors text-red-400 hover:text-red-300"
+                      title={`Remove ${player.name} from room`}
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
               </div>
             ))}
           </div>

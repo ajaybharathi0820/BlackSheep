@@ -1,11 +1,12 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { Room, Player, ChatMessage } from '@/types/game';
-import { updateRoom, sendChatMessage, subscribeToChatMessages, clearChatMessages } from '@/utils/firebaseUtils';
+import { Room, Player } from '@/types/game';
+import { updateRoom, addPlayerClue, checkAllPlayersGaveClues, resetPlayersForNewRound, clearChatMessages } from '@/utils/firebaseUtils';
 import { deleteField } from 'firebase/firestore';
-import { MessageCircle, Vote, RefreshCw, LogOut, Trophy, Home } from 'lucide-react';
+import { RefreshCw, LogOut, Trophy, Home, Users, Clock, Vote } from 'lucide-react';
 import Results from './Results';
+import PlayerCard from './PlayerCard';
 
 interface GameBoardProps {
   room: Room;
@@ -13,32 +14,33 @@ interface GameBoardProps {
 }
 
 export default function GameBoard({ room, currentPlayer }: GameBoardProps) {
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [newMessage, setNewMessage] = useState('');
-  const [showWord, setShowWord] = useState(false); // Changed to false by default
+  const [showWord, setShowWord] = useState(false);
   const [selectedVote, setSelectedVote] = useState<string>('');
   const [isVoting, setIsVoting] = useState(false);
   const [isStartingVoting, setIsStartingVoting] = useState(false);
 
-  useEffect(() => {
-    // Subscribe to chat messages
-    const unsubscribe = subscribeToChatMessages(room.id, setChatMessages);
-    return () => unsubscribe();
-  }, [room.id]);
-
-  const sendMessage = async () => {
-    if (!newMessage.trim() || room.gameState !== 'clue') return;
+  const handleAddClue = async (clue: string) => {
+    if (!clue.trim() || room.gameState !== 'clue' || currentPlayer.hasGivenClue) return;
 
     try {
-      await sendChatMessage(room.id, {
-        playerId: currentPlayer.id,
-        playerName: currentPlayer.name,
-        message: newMessage.trim(),
-        round: room.currentRound
-      });
-      setNewMessage('');
+      await addPlayerClue(room.id, currentPlayer.id, clue, room.players);
+      
+      // Check if all players have given clues and auto-start voting if so
+      const updatedPlayers = room.players.map(player => 
+        player.id === currentPlayer.id 
+          ? { ...player, clues: [...(player.clues || []), clue], hasGivenClue: true }
+          : player
+      );
+      
+      if (checkAllPlayersGaveClues(updatedPlayers)) {
+        // Auto-start voting phase when everyone has given clues
+        setTimeout(async () => {
+          await updateRoom(room.id, { gameState: 'voting' });
+        }, 1000);
+      }
     } catch (error) {
-      console.error('Error sending message:', error);
+      console.error('Error adding clue:', error);
+      throw error;
     }
   };
 
@@ -77,12 +79,15 @@ export default function GameBoard({ room, currentPlayer }: GameBoardProps) {
         // Get new word pair (excluding current used pairs)
         const wordPair = getUnusedWordPair(room.usedWordPairs || []);
         
-        // Assign new words to players
+        // Assign new words to players and reset clue tracking
         const updatedPlayers = room.players.map(player => ({
           ...player,
           isImposter: player.id === imposterPlayer,
           word: player.id === imposterPlayer ? wordPair.imposter : wordPair.main,
-          hasVoted: false
+          hasVoted: false,
+          clues: [],
+          hasGivenClue: false,
+          hasLeft: false
         }));
 
         // Add new word pair to used list
@@ -103,47 +108,66 @@ export default function GameBoard({ room, currentPlayer }: GameBoardProps) {
   };
 
   const quitGame = async () => {
-    if (confirm('Are you sure you want to quit the game? You will return to the home page.')) {
+    // Different behavior based on game state
+    const isGameActive = room.gameState !== 'waiting' && room.gameState !== 'starting';
+    const confirmMessage = isGameActive 
+      ? 'Are you sure you want to quit the game? You will be marked as left but can still spectate.'
+      : 'Are you sure you want to leave the room?';
+    
+    if (confirm(confirmMessage)) {
       try {
-        // Remove player from the room
-        const updatedPlayers = room.players.filter(p => p.id !== currentPlayer.id);
-        
-        if (updatedPlayers.length === 0) {
-          // If no players left, we could delete the room
-          // For now, just update with empty players array
-          await updateRoom(room.id, {
-            players: updatedPlayers
-          });
-        } else {
-          // If current player was the host, transfer host to another player
+        if (isGameActive) {
+          // During active game - mark player as left instead of removing them
+          const updatedPlayers = room.players.map(player => 
+            player.id === currentPlayer.id 
+              ? { ...player, hasLeft: true, isAlive: false } // Mark as left and not alive for game logic
+              : player
+          );
+          
+          // If current player was the host, transfer host to another active player
           const needNewHost = currentPlayer.isHost;
-          const finalPlayers = needNewHost && updatedPlayers.length > 0
-            ? updatedPlayers.map((player, index) => 
-                index === 0 ? { ...player, isHost: true } : player
-              )
-            : updatedPlayers;
+          let finalPlayers = updatedPlayers;
           
-          // Check if there are 2 or fewer players left after quitting
-          const alivePlayers = finalPlayers.filter(p => p.isAlive);
+          if (needNewHost) {
+            const activePlayer = updatedPlayers.find(p => !p.hasLeft);
+            if (activePlayer) {
+              finalPlayers = updatedPlayers.map(player => 
+                player.id === activePlayer.id 
+                  ? { ...player, isHost: true }
+                  : { ...player, isHost: false }
+              );
+            }
+          }
           
-          if (alivePlayers.length <= 2) {
-            // Determine winner based on who's left
-            const aliveImposters = alivePlayers.filter(p => p.isImposter);
+          // Check if there are enough active players left to continue the game
+          const activePlayers = finalPlayers.filter(p => !p.hasLeft);
+          const aliveActivePlayers = activePlayers.filter(p => p.isAlive);
+          
+          if (activePlayers.length === 0) {
+            // All players left - end the game
+            await updateRoom(room.id, {
+              players: finalPlayers,
+              gameState: 'finished',
+              winner: null,
+              gameEndReason: 'All players left the game.'
+            });
+          } else if (aliveActivePlayers.length <= 2) {
+            // Not enough active players to continue - determine winner
+            const aliveImposters = aliveActivePlayers.filter(p => p.isImposter);
             let winner: 'imposters' | 'civilians' | null = null;
             let reason = '';
             
             if (aliveImposters.length > 0) {
               winner = 'imposters';
               reason = 'The imposter survived - imposters win!';
-            } else if (alivePlayers.length === 0) {
+            } else if (aliveActivePlayers.length === 0) {
               winner = null;
-              reason = 'All players left the game.';
+              reason = 'All remaining players left the game.';
             } else {
               winner = 'civilians';
               reason = 'All imposters eliminated - civilians win!';
             }
             
-            // End the game with proper winner determination
             await updateRoom(room.id, {
               players: finalPlayers,
               gameState: 'finished',
@@ -151,10 +175,28 @@ export default function GameBoard({ room, currentPlayer }: GameBoardProps) {
               gameEndReason: reason
             });
           } else {
+            // Game can continue with remaining players
             await updateRoom(room.id, {
               players: finalPlayers
             });
           }
+        } else {
+          // Before game starts (waiting/starting) - completely remove player
+          const updatedPlayers = room.players.filter(p => p.id !== currentPlayer.id);
+          
+          // If current player was the host, transfer host to another player
+          const needNewHost = currentPlayer.isHost;
+          let finalPlayers = updatedPlayers;
+          
+          if (needNewHost && updatedPlayers.length > 0) {
+            finalPlayers = updatedPlayers.map((player, index) => 
+              index === 0 ? { ...player, isHost: true } : player
+            );
+          }
+          
+          await updateRoom(room.id, {
+            players: finalPlayers
+          });
         }
         
         // Clear localStorage and go home
@@ -164,17 +206,21 @@ export default function GameBoard({ room, currentPlayer }: GameBoardProps) {
       } catch (error) {
         console.error('Error quitting game:', error);
         // Still go home even if there's an error
+        localStorage.removeItem('playerId');
+        localStorage.removeItem('playerName');
         window.location.href = '/';
       }
     }
   };
 
-  const submitVote = async () => {
-    if (!selectedVote || room.gameState !== 'voting') return;
+  const handleVote = async (votedPlayerId: string) => {
+    if (room.gameState !== 'voting' || currentPlayer.hasVoted) return;
 
     setIsVoting(true);
+    setSelectedVote(votedPlayerId);
+    
     try {
-      const updatedVotes = { ...room.votes, [currentPlayer.id]: selectedVote };
+      const updatedVotes = { ...room.votes, [currentPlayer.id]: votedPlayerId };
       const updatedPlayers = room.players.map(player => 
         player.id === currentPlayer.id 
           ? { ...player, hasVoted: true }
@@ -199,8 +245,9 @@ export default function GameBoard({ room, currentPlayer }: GameBoardProps) {
     }
   };
 
-  const alivePlayers = room.players.filter(p => p.isAlive);
-  const votableePlayers = alivePlayers.filter(p => p.id !== currentPlayer.id);
+  const alivePlayers = room.players.filter(p => p.isAlive && !p.hasLeft);
+  const allActivePlayers = room.players.filter(p => !p.hasLeft);
+  const allPlayersGaveClues = checkAllPlayersGaveClues(room.players);
 
   // Show results component for results state
   if (room.gameState === 'results') {
@@ -225,7 +272,10 @@ export default function GameBoard({ room, currentPlayer }: GameBoardProps) {
           isAlive: true,
           hasVoted: false,
           word: '',
-          isImposter: false
+          isImposter: false,
+          clues: [],
+          hasGivenClue: false,
+          hasLeft: false
         }));
         
         await updateRoom(room.id, {
@@ -234,8 +284,8 @@ export default function GameBoard({ room, currentPlayer }: GameBoardProps) {
           currentRound: 0,
           votes: {},
           usedWordPairs: [],
-          winner: deleteField(),
-          gameEndReason: deleteField()
+          winner: null,
+          gameEndReason: ''
         });
       } catch (error) {
         console.error('Error restarting game:', error);
@@ -339,34 +389,111 @@ export default function GameBoard({ room, currentPlayer }: GameBoardProps) {
   if (!currentPlayer.isAlive) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-purple-900 via-blue-900 to-indigo-900 p-4">
-        <div className="max-w-4xl mx-auto">
-          <div className="bg-white/10 backdrop-blur-md rounded-2xl p-8 text-center border border-white/20">
-            <h1 className="text-2xl font-bold text-white mb-4">You've been eliminated!</h1>
-            <p className="text-white/80 mb-6">Watch the remaining players continue the game.</p>
-            
-            {/* Show spectator view */}
-            <div className="mt-6 bg-white/5 rounded-lg p-4">
-              <h3 className="text-white font-semibold mb-2">Remaining Players</h3>
-              <div className="flex flex-wrap gap-2 justify-center">
-                {alivePlayers.map(player => (
-                  <div key={player.id} className="bg-white/10 px-3 py-1 rounded-full">
-                    <span className="text-white text-sm">{player.name}</span>
+        <div className="max-w-7xl mx-auto">
+          {/* Spectator Header */}
+          <div className="flex flex-col lg:flex-row lg:justify-between lg:items-center mb-6 gap-4">
+            <div>
+              <h1 className="text-3xl font-bold text-white flex items-center gap-2">
+                <span className="text-red-400">👻</span> Spectator Mode
+              </h1>
+              <div className="flex items-center gap-4 mt-2">
+                <div className="text-white/70 text-sm">Round {room.currentRound}</div>
+                <div className="text-white/70 text-sm flex items-center gap-1">
+                  <Users className="w-4 h-4" />
+                  {alivePlayers.length} players remaining
+                </div>
+                {room.gameState === 'clue' && (
+                  <div className="text-white/70 text-sm flex items-center gap-1">
+                    <Clock className="w-4 h-4" />
+                    {alivePlayers.filter(p => (p.clues?.length || 0) > 0).length}/{alivePlayers.length} clues given
                   </div>
-                ))}
+                )}
               </div>
             </div>
-            
-            {/* Quit Button for Eliminated Players */}
-            <div className="mt-6">
-              <button
-                onClick={quitGame}
-                className="flex items-center gap-2 px-6 py-3 bg-red-500/20 hover:bg-red-500/30 border border-red-400/30 text-red-300 hover:text-red-200 rounded-lg transition-colors mx-auto"
-              >
-                <LogOut className="w-4 h-4" />
-                Quit Game
-              </button>
+
+            {/* Spectator Progress Status - Middle */}
+            <div className="flex-1 flex justify-center">
+              {room.gameState === 'clue' && !allPlayersGaveClues && (
+                <div className="inline-flex items-center gap-2 px-4 py-2 bg-yellow-500/20 text-yellow-300 rounded-lg">
+                  <Clock className="w-4 h-4" />
+                  Waiting for remaining players to give clues...
+                  <span className="font-semibold">
+                    {alivePlayers.filter(p => (p.clues?.length || 0) > 0).length}/{alivePlayers.length}
+                  </span>
+                </div>
+              )}
+
+              {room.gameState === 'clue' && allPlayersGaveClues && (
+                <div className="inline-flex items-center gap-2 px-4 py-2 bg-green-500/20 text-green-300 rounded-lg">
+                  ✓ All clues given! Voting phase starting...
+                </div>
+              )}
+
+              {room.gameState === 'voting' && (
+                <div className="inline-flex items-center gap-2 px-4 py-2 bg-blue-500/20 text-blue-300 rounded-lg">
+                  🗳️ Players are voting... Watch the cards for real-time updates!
+                </div>
+              )}
+            </div>
+
+            <button
+              onClick={quitGame}
+              className="flex items-center gap-2 px-4 py-2 bg-red-500/20 hover:bg-red-500/30 border border-red-400/30 text-red-300 hover:text-red-200 rounded-lg transition-colors"
+            >
+              <LogOut className="w-4 h-4" />
+              Leave Game
+            </button>
+          </div>
+
+          {/* Spectator Info Banner */}
+          <div className="bg-red-500/10 backdrop-blur-md rounded-2xl p-4 mb-6 border border-red-400/20">
+            <div className="flex items-center justify-center gap-3">
+              <span className="text-red-400 text-xl">💀</span>
+              <div className="text-center">
+                <h2 className="text-red-300 font-semibold">You've been eliminated!</h2>
+                <p className="text-white/70 text-sm">Watch the remaining players and see how the game unfolds.</p>
+              </div>
             </div>
           </div>
+
+          {/* Game State for Spectators */}
+          <div className="mb-6">
+            {renderGameState()}
+          </div>
+
+          {/* Live Player Cards for Spectating */}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 mb-6">
+            {(() => {
+              // Sort players to put current player first
+              const sortedPlayers = [...room.players].sort((a, b) => {
+                if (a.id === currentPlayer.id) return -1;
+                if (b.id === currentPlayer.id) return 1;
+                return 0;
+              });
+              return sortedPlayers.map(player => (
+                <div key={player.id} className={`relative ${
+                  !player.isAlive ? 'opacity-40' : ''
+                }`}>
+                  {player.id === currentPlayer.id && (
+                    <div className="absolute -top-2 -right-2 bg-red-500 text-white text-xs px-2 py-1 rounded-full z-10">
+                      You
+                    </div>
+                  )}
+                  <PlayerCard
+                    player={player}
+                    currentPlayer={currentPlayer}
+                    room={room}
+                    onVote={() => {}} // Spectators can't vote
+                    onAddClue={() => {}} // Spectators can't add clues
+                    isVotingEnabled={false}
+                    selectedVote={""}
+                  />
+                </div>
+              ));
+            })()}
+          </div>
+
+
         </div>
       </div>
     );
@@ -374,132 +501,63 @@ export default function GameBoard({ room, currentPlayer }: GameBoardProps) {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-purple-900 via-blue-900 to-indigo-900 p-4">
-      <div className="max-w-6xl mx-auto">
-        {/* Header with Quit Button */}
-        <div className="flex justify-between items-center mb-6">
-          <h1 className="text-2xl font-bold text-white">BlackSheep Game</h1>
-          <button
-            onClick={quitGame}
-            className="flex items-center gap-2 px-4 py-2 bg-red-500/20 hover:bg-red-500/30 border border-red-400/30 text-red-300 hover:text-red-200 rounded-lg transition-colors"
-          >
-            <LogOut className="w-4 h-4" />
-            Quit Game
-          </button>
-        </div>
-
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        
-        {/* Left Panel - Game Info */}
-        <div className="space-y-4">
-          {/* Your Word */}
-          <div className="bg-white/10 backdrop-blur-md rounded-2xl p-4 border border-white/20">
-            <h2 className="text-lg font-semibold text-white mb-3">Your Word</h2>
-            <div className="text-center">
-              <div 
-                className={`text-2xl font-bold p-4 rounded-lg min-h-[80px] flex items-center justify-center transition-all duration-200 cursor-pointer select-none ${
-                  currentPlayer.isImposter && room.showImposterRole
-                    ? 'bg-red-500/20 text-red-300 border border-red-400/30 hover:bg-red-500/30' 
-                    : 'bg-blue-500/20 text-blue-300 border border-blue-400/30 hover:bg-blue-500/30'
-                } ${showWord ? 'scale-105 ring-2 ring-white/30' : ''}`}
-                onMouseDown={() => setShowWord(true)}
-                onMouseUp={() => setShowWord(false)}
-                onMouseLeave={() => setShowWord(false)}
-                onTouchStart={() => setShowWord(true)}
-                onTouchEnd={() => setShowWord(false)}
-                title="Hold to reveal your word"
-              >
-                {showWord ? currentPlayer.word : (
-                  <div className="flex flex-col items-center gap-2 text-white/50">
-                    <span className="text-4xl">👁️</span>
-                    <span className="text-sm">Hold to reveal</span>
-                  </div>
-                )}
+      <div className="max-w-7xl mx-auto">
+        {/* Header */}
+        <div className="flex flex-col lg:flex-row lg:justify-between lg:items-center mb-6 gap-4">
+          <div>
+            <h1 className="text-3xl font-bold text-white">BlackSheep Game</h1>
+            <div className="flex items-center gap-4 mt-2">
+              <div className="text-white/70 text-sm">Round {room.currentRound}</div>
+              <div className="text-white/70 text-sm flex items-center gap-1">
+                <Users className="w-4 h-4" />
+                {alivePlayers.length} active players
               </div>
-              {currentPlayer.isImposter && room.showImposterRole && (
-                <p className="text-red-300 text-sm mt-2 font-medium">🎭 You are the imposter!</p>
-              )}
-              {!showWord && (
-                <p className="text-white/50 text-xs mt-2">
-                  Hold the area above to see your word
-                </p>
-              )}
-            </div>
-          </div>
-
-          {/* Players */}
-          <div className="bg-white/10 backdrop-blur-md rounded-2xl p-4 border border-white/20">
-            <h2 className="text-lg font-semibold text-white mb-3">
-              Players ({alivePlayers.length})
-            </h2>
-            <div className="space-y-2">
-              {room.players.map(player => (
-                <div
-                  key={player.id}
-                  className={`flex items-center justify-between p-2 rounded-lg ${
-                    !player.isAlive 
-                      ? 'opacity-50 bg-gray-500/20' 
-                      : player.hasVoted && room.gameState === 'voting'
-                        ? 'bg-green-500/20'
-                        : 'bg-white/5'
-                  }`}
-                >
-                  <span className={`${
-                    player.id === currentPlayer.id ? 'text-yellow-300 font-medium' : 'text-white'
-                  }`}>
-                    {player.name}
-                    {player.id === currentPlayer.id && ' (You)'}
-                    {!player.isAlive && ' ❌'}
-                  </span>
-                  {player.hasVoted && room.gameState === 'voting' && (
-                    <span className="text-green-300 text-sm">✓</span>
-                  )}
+              {room.gameState === 'clue' && (
+                <div className="text-white/70 text-sm flex items-center gap-1">
+                  <Clock className="w-4 h-4" />
+                  {alivePlayers.filter(p => (p.clues?.length || 0) > 0).length}/{alivePlayers.length} clues given
                 </div>
-              ))}
+              )}
             </div>
           </div>
 
-          {/* Voting Panel */}
-          {room.gameState === 'voting' && !currentPlayer.hasVoted && (
-            <div className="bg-white/10 backdrop-blur-md rounded-2xl p-4 border border-white/20">
-              <h2 className="text-lg font-semibold text-white mb-3">Cast Your Vote</h2>
-              <div className="space-y-2 mb-4">
-                {votableePlayers.map(player => (
-                  <label
-                    key={player.id}
-                    className="flex items-center p-2 rounded-lg bg-white/5 hover:bg-white/10 cursor-pointer transition-colors"
-                  >
-                    <input
-                      type="radio"
-                      name="vote"
-                      value={player.id}
-                      checked={selectedVote === player.id}
-                      onChange={(e) => setSelectedVote(e.target.value)}
-                      className="mr-3 accent-red-500"
-                    />
-                    <span className="text-white">{player.name}</span>
-                  </label>
-                ))}
+          {/* Game Progress Status - Middle */}
+          <div className="flex-1 flex justify-center">
+            {/* Progress Info */}
+            {room.gameState === 'clue' && !allPlayersGaveClues && (
+              <div className="inline-flex items-center gap-2 px-4 py-2 bg-yellow-500/20 text-yellow-300 rounded-lg">
+                <Clock className="w-4 h-4" />
+                Waiting for all players to give clues...
+                <span className="font-semibold">
+                  {alivePlayers.filter(p => (p.clues?.length || 0) > 0).length}/{alivePlayers.length}
+                </span>
               </div>
-              <button
-                onClick={submitVote}
-                disabled={!selectedVote || isVoting}
-                className="w-full bg-gradient-to-r from-red-500 to-pink-600 hover:from-red-600 hover:to-pink-700 disabled:from-gray-500 disabled:to-gray-600 text-white font-semibold py-2 px-4 rounded-lg transition duration-200 disabled:cursor-not-allowed"
-              >
-                {isVoting ? 'Voting...' : 'Submit Vote'}
-              </button>
-            </div>
-          )}
+            )}
 
-          {/* Reset Words Button (Host Only) */}
-          {room.gameState === 'clue' && currentPlayer.isHost && (
-            <div className="bg-white/10 backdrop-blur-md rounded-2xl p-4 border border-white/20">
+            {room.gameState === 'clue' && allPlayersGaveClues && (
+              <div className="inline-flex items-center gap-2 px-4 py-2 bg-green-500/20 text-green-300 rounded-lg">
+                ✓ All clues given! Voting will start automatically...
+              </div>
+            )}
+
+            {room.gameState === 'voting' && (
+              <div className="inline-flex items-center gap-2 px-4 py-2 bg-blue-500/20 text-blue-300 rounded-lg">
+                🗳️ Voting Phase - Select who you think is the imposter
+              </div>
+            )}
+          </div>
+
+          <div className="flex items-center gap-3">
+            {/* Reset Words Button (Host Only) */}
+            {room.gameState === 'clue' && currentPlayer.isHost && (
               <button
                 onClick={resetWords}
                 disabled={isStartingVoting}
-                className="w-full bg-gradient-to-r from-yellow-500 to-orange-600 hover:from-yellow-600 hover:to-orange-700 disabled:from-gray-500 disabled:to-gray-600 text-white font-semibold py-3 px-4 rounded-lg transition duration-200 flex items-center justify-center gap-2 disabled:cursor-not-allowed"
+                className="flex items-center gap-2 px-4 py-2 bg-yellow-500/20 hover:bg-yellow-500/30 border border-yellow-400/30 text-yellow-300 hover:text-yellow-200 rounded-lg transition-colors disabled:cursor-not-allowed"
+                title="Reset words if current ones are confusing"
               >
                 {isStartingVoting ? (
-                  <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                  <div className="w-4 h-4 border-2 border-yellow-300/30 border-t-yellow-300 rounded-full animate-spin" />
                 ) : (
                   <>
                     <RefreshCw className="w-4 h-4" />
@@ -507,117 +565,87 @@ export default function GameBoard({ room, currentPlayer }: GameBoardProps) {
                   </>
                 )}
               </button>
-              <p className="text-white/60 text-xs mt-2 text-center">
-                Get new words if current ones are confusing
-              </p>
-            </div>
-          )}
-
-          {/* Start Voting Button */}
-          {room.gameState === 'clue' && (() => {
-            const originalHost = room.players.find(p => p.isHost);
-            const canStartVoting = currentPlayer.isHost || (originalHost && !originalHost.isAlive);
-            return canStartVoting;
-          })() && (
-            <div className="bg-white/10 backdrop-blur-md rounded-2xl p-4 border border-white/20">
-              <button
-                onClick={startVotingPhase}
-                disabled={isStartingVoting}
-                className="w-full bg-gradient-to-r from-red-500 to-pink-600 hover:from-red-600 hover:to-pink-700 disabled:from-gray-500 disabled:to-gray-600 text-white font-semibold py-3 px-4 rounded-lg transition duration-200 flex items-center justify-center gap-2 disabled:cursor-not-allowed"
-              >
-                {isStartingVoting ? (
-                  <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                ) : (
-                  <>
-                    <Vote className="w-4 h-4" />
-                    Start Voting Phase
-                  </>
-                )}
-              </button>
-              <p className="text-white/60 text-xs mt-2 text-center">
-                {(() => {
-                  const originalHost = room.players.find(p => p.isHost);
-                  const isHostEliminated = originalHost && !originalHost.isAlive;
-                  return isHostEliminated && !currentPlayer.isHost 
-                    ? "Host eliminated - any player can start voting"
-                    : "Click when discussion is complete";
-                })()}
-              </p>
-            </div>
-          )}
-        </div>
-
-        {/* Right Panel - Chat */}
-        <div className="lg:col-span-2">
-          <div className="bg-white/10 backdrop-blur-md rounded-2xl border border-white/20 h-[600px] flex flex-col">
-            
-            {/* Game State Header */}
-            <div className="p-4 border-b border-white/20">
-              {renderGameState()}
-              <div className="flex items-center justify-between">
-                <h2 className="text-xl font-semibold text-white flex items-center gap-2">
-                  <MessageCircle className="w-5 h-5" />
-                  Game Chat
-                </h2>
-                <span className="text-white/60 text-sm">Round {room.currentRound}</span>
-              </div>
-            </div>
-
-            {/* Messages */}
-            <div className="flex-1 overflow-y-auto p-4 space-y-3">
-              {chatMessages
-                .map(message => (
-                <div
-                  key={message.id}
-                  className={`p-3 rounded-lg ${
-                    message.playerId === currentPlayer.id
-                      ? 'bg-blue-500/20 ml-8'
-                      : 'bg-white/5 mr-8'
-                  }`}
-                >
-                  <div className="flex items-center justify-between mb-1">
-                    <span className="font-medium text-white text-sm">
-                      {message.playerName}
-                      {message.playerId === currentPlayer.id && ' (You)'}
-                    </span>
-                    <span className="text-white/50 text-xs">
-                      {message.timestamp instanceof Date 
-                        ? message.timestamp.toLocaleTimeString()
-                        : new Date((message.timestamp as any).seconds * 1000).toLocaleTimeString()
-                      }
-                    </span>
-                  </div>
-                  <p className="text-white/90">{message.message}</p>
-                </div>
-              ))}
-            </div>
-
-            {/* Message Input */}
-            {room.gameState === 'clue' && (
-              <div className="p-4 border-t border-white/20">
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    value={newMessage}
-                    onChange={(e) => setNewMessage(e.target.value)}
-                    onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
-                    placeholder="Give a clue about your word..."
-                    className="flex-1 px-4 py-2 bg-white/10 border border-white/20 rounded-lg text-white placeholder-white/50 focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
-                    maxLength={100}
-                  />
-                  <button
-                    onClick={sendMessage}
-                    disabled={!newMessage.trim()}
-                    className="px-4 py-2 bg-gradient-to-r from-blue-500 to-cyan-600 hover:from-blue-600 hover:to-cyan-700 disabled:from-gray-500 disabled:to-gray-600 text-white font-medium rounded-lg transition duration-200 disabled:cursor-not-allowed"
-                  >
-                    Send
-                  </button>
-                </div>
-              </div>
             )}
+            <button
+              onClick={quitGame}
+              className="flex items-center gap-2 px-4 py-2 bg-red-500/20 hover:bg-red-500/30 border border-red-400/30 text-red-300 hover:text-red-200 rounded-lg transition-colors"
+            >
+              <LogOut className="w-4 h-4" />
+              Quit Game
+            </button>
           </div>
         </div>
-      </div>
+
+        {/* Word Section and Game State Row */}
+        <div className="mb-6">
+          <div className="flex flex-col md:flex-row gap-4 items-stretch">
+            {/* Player Word Section - Compact */}
+            <div className="bg-gradient-to-br from-white/15 to-white/5 backdrop-blur-md rounded-xl p-4 border border-white/20 shadow-lg md:w-64 flex-shrink-0">
+              <div className="flex items-center gap-2 mb-3">
+                <span className="text-lg">🎯</span>
+                <h2 className="text-sm font-semibold text-white">Your Word</h2>
+              </div>
+              <div 
+                className={`relative text-lg font-bold p-2 rounded-lg min-h-[45px] flex items-center justify-center transition-all duration-300 cursor-pointer select-none group ${
+                  currentPlayer.isImposter && room.showImposterRole
+                    ? 'bg-gradient-to-br from-red-500/30 to-red-600/20 text-red-200 border border-red-400/40 hover:from-red-500/40 hover:to-red-600/30' 
+                    : 'bg-gradient-to-br from-blue-500/30 to-cyan-600/20 text-blue-200 border border-blue-400/40 hover:from-blue-500/40 hover:to-cyan-600/30'
+                } ${showWord ? 'scale-105 shadow-lg ring-2 ring-white/40' : 'hover:scale-102'}`}
+                onMouseDown={() => setShowWord(true)}
+                onMouseUp={() => setShowWord(false)}
+                onMouseLeave={() => setShowWord(false)}
+                onTouchStart={() => setShowWord(true)}
+                onTouchEnd={() => setShowWord(false)}
+                title="Hold to reveal your word"
+              >
+                {showWord ? (
+                  <span className="font-black tracking-wide">{currentPlayer.word}</span>
+                ) : (
+                  <div className="flex flex-col items-center gap-1">
+                    <div className="text-2xl opacity-60 group-hover:opacity-80 transition-opacity">👁️</div>
+                    <span className="text-xs font-medium opacity-60 group-hover:opacity-80 transition-opacity">Hold to reveal</span>
+                  </div>
+                )}
+                {currentPlayer.isImposter && room.showImposterRole && showWord && (
+                  <div className="absolute -bottom-2 -right-2 bg-red-500 text-white text-xs px-2 py-1 rounded-full font-bold animate-pulse">
+                    🎭 IMPOSTER
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Game State Banner - Expanded */}
+            <div className="flex-1 min-w-0">
+              {renderGameState()}
+            </div>
+          </div>
+        </div>
+
+        {/* Player Cards Grid */}
+        <div>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+            {(() => {
+              // Sort players to put current player first
+              const sortedPlayers = [...room.players].sort((a, b) => {
+                if (a.id === currentPlayer.id) return -1;
+                if (b.id === currentPlayer.id) return 1;
+                return 0;
+              });
+              return sortedPlayers.map(player => (
+                <PlayerCard
+                  key={player.id}
+                  player={player}
+                  currentPlayer={currentPlayer}
+                  room={room}
+                  onVote={handleVote}
+                  onAddClue={handleAddClue}
+                  isVotingEnabled={allPlayersGaveClues}
+                  selectedVote={selectedVote}
+                />
+              ));
+            })()}
+          </div>
+        </div>
       </div>
     </div>
   );

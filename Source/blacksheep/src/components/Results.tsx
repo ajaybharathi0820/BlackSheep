@@ -104,7 +104,10 @@ export default function Results({ room, currentPlayer }: ResultsProps) {
         isAlive: true,
         hasVoted: false,
         word: '',
-        isImposter: false
+        isImposter: false,
+        clues: [],
+        hasGivenClue: false,
+        hasLeft: false
       }));
       
       await resetRoomForNewGame(room.id, {

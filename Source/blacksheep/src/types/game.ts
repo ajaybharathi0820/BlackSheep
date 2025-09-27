@@ -6,6 +6,9 @@ export interface Player {
   isImposter: boolean;
   word: string;
   hasVoted: boolean;
+  clues: string[]; // Array of clues given by this player in current round
+  hasGivenClue: boolean; // Whether player has given a clue this round
+  hasLeft: boolean; // Whether player has quit/left the game
 }
 
 export interface Room {
@@ -37,6 +40,15 @@ export interface ChatMessage {
   playerId: string;
   playerName: string;
   message: string;
+  timestamp: Date;
+  round: number;
+}
+
+export interface PlayerClue {
+  id: string;
+  playerId: string;
+  playerName: string;
+  clue: string;
   timestamp: Date;
   round: number;
 }
